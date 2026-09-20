@@ -48,7 +48,8 @@ TypeGPU 0.12 example. The finished adapter:
 - leaves final traversal or draw submission to the host renderer.
 
 The example package exercises the same public API available to Three and R3F. There is no privileged adapter import,
-hidden hook, or second runtime.
+hidden hook, or second runtime. A host that only needs shaping and layout can stop at
+[the headless config](headless-integration.md), which keeps every renderer hook inert.
 
 > **Proof boundary.** `TypeGpuExampleRendererDevice` currently owns an offscreen texture and submits a WebGPU pass while
 > committing accepted state. It proves buffers, geometry, shaders, pixels, failure atomicity, and cleanup. A reusable

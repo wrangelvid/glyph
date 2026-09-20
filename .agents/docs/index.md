@@ -17,6 +17,8 @@ okf_version: '0.2'
 - [TypeGPU-first shader authority](planning/typegpu-first-shader-authority.md) — exploratory TypeGPU-first shader/program architecture, Three and gpucat bridge limits, fallback authority models, and proof gates.
 - [Renderer integration guide](guides/renderer-integration.md) — the config-only path for a custom engine: define its
   schema, Codec, resource resolver, renderer decoder, and root recipe through the same public API used by Three.
+- [Headless integration guide](guides/headless-integration.md) — the smallest GlyphConfig that measures and inspects
+  text with inert renderer hooks, for hosts that keep their own renderer or only need metrics.
 - [Portable raster-format implementation report](guides/technique-implementation-report.md) — worked raster format,
   Codec, raster program, shader, baker, and renderer examples with ownership maps and the end-to-end draw flow.
 - [Merged v0 raster and baker plugin guide](planning/raster-baker-plugin.md) — build against the implemented combined runtime/renderer module before the target v1 extraction replaces it.
