@@ -1,5 +1,14 @@
 # pmndrs/glyph documentation update log
 
+## 2026-09-20
+
+- **Added the headless integration guide** — Documented the smallest `GlyphConfig` that shapes and lays out text with
+  inert schema, resolver, and renderer hooks, so a host that keeps its own renderer or only needs metrics can call
+  `measure()` and `inspect()` without `glyph.shape()`. The guide covers the required Codec program, Node bootstrap,
+  constraints and vertical alignment, and the current `shape()` ordering rules around disposal. Its config block is
+  asserted byte-for-byte against `packages/glyph/tests/integration/headless-config.test.mjs`.
+  See [the guide](guides/headless-integration.md).
+
 ## 2026-09-18
 
 - **Added tagged stable publishing alongside canaries** — Extended the existing npm publishing workflow so matching
