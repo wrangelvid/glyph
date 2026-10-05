@@ -983,7 +983,7 @@ class RenderPlannerImpl {
       });
     }
     const geometry = compileGeometry(this.#handleState, state, 0, 0);
-    const textChanged = !state.published || state.publishedText !== state.desired.text;
+    const textMutation = minimalTextMutation(state.publishedText, state.desired.text);
     return compilePlannerFrameUpdate({
       rootId: this.#transport.handle,
       codecHandle: this.#codec.handle,
@@ -995,16 +995,7 @@ class RenderPlannerImpl {
       limits: this.#limits,
       paragraphMutations: this.#measurementParagraphMutations(state),
       paragraphOrderMutations: this.#measurementParagraphOrderMutations(),
-      textMutations: textChanged
-        ? [
-            {
-              paragraphId: state.paragraphId,
-              start: 0,
-              deleteCount: state.publishedText.length,
-              insert: state.desired.text,
-            },
-          ]
-        : [],
+      textMutations: textMutation === undefined ? [] : [{ paragraphId: state.paragraphId, ...textMutation }],
       styleMutations,
       constraints: [geometry.constraint],
       regions: geometry.regions,
@@ -1015,8 +1006,12 @@ class RenderPlannerImpl {
 
   #compileFrame(options: NormalizedPublishOptions, checkpointGeneration: number): Uint8Array {
     this.#assertUniqueBaseOrders();
+    // A measured but never published text only ever existed as the engine's speculative candidate,
+    // which the frame drops on its own; only a committed paragraph has something to remove.
     const paragraphMutations = [
-      ...[...this.#removed].map((state) => ({ opcode: 'remove' as const, paragraphId: state.paragraphId })),
+      ...[...this.#removed]
+        .filter((state) => state.published)
+        .map((state) => ({ opcode: 'remove' as const, paragraphId: state.paragraphId })),
       ...[...this.#texts]
         .filter((state) => !state.removed && state.lifecycleDirty)
         .map((state) => ({
