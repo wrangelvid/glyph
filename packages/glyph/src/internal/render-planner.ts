@@ -5,9 +5,11 @@ import { GlyphEngineStatusError } from '../engine-error.js';
 import {
   copyGlyphLayoutInspection,
   type BorrowedGlyphLayout,
+  type GlyphLayoutColumns,
   type GlyphLayoutInspection,
   type ParagraphLayoutSummary,
 } from '../layout.js';
+import { requireGlyphOutlineStore, storedGlyphOutline, type GlyphOutlineStore } from '../glyph-outline.js';
 import {
   assertConstraints,
   assertParagraphLayout,
@@ -26,11 +28,11 @@ import {
   normalizedColumns,
 } from '../engine-encoding.js';
 import {
-  compilePlannerFrameUpdate,
   MAX_TEXT_ENGINE_OUTPUT_BYTES,
   type PlannerConstraint,
   type PlannerExclusion,
   type PlannerFrameLimits,
+  type PlannerFrameUpdate,
   type PlannerInlineObject,
   type PlannerParagraphMutation,
   type PlannerParagraphOrderMutation,
@@ -50,7 +52,12 @@ import type {
 } from './handle-state.js';
 import { RenderPlanView, type RenderPlanTable } from './plan-view.js';
 import { measurementFromLayoutInspection, readPlannerLayouts, readPlannerMeasurements } from './layout-query-view.js';
-import { createBorrowedGlyphLayout, createInspectionBorrowedGlyphLayout } from './borrowed-layout-view.js';
+import {
+  createBorrowedGlyphLayout,
+  createInspectionBorrowedGlyphLayout,
+  fontHandleAt,
+  type OutlineDecoder,
+} from './borrowed-layout-view.js';
 import type { PortableResource } from '../config/resources.js';
 import { reuseOrCreateTextPropertySnapshot } from '../config/text-property.js';
 import type { ParagraphId, ResourceHandle } from './glyph-id.js';
@@ -255,7 +262,7 @@ export interface RetainedText {
   /** Returns caller-owned columns; a cache miss may synchronously incur glyph lookup and positioning work. */
   glyphs(): GlyphLayoutInspection;
   /** Demand-reads positioned glyphs through a synchronous expiring view. */
-  withGlyphs<Result>(read: (glyphs: BorrowedGlyphLayout) => Result): Result;
+  readGlyphs<Result>(read: (glyphs: BorrowedGlyphLayout) => Result): Result;
   /** Offers a complete checkpoint containing selected committed stable glyph ids to one renderer target. */
   copyGlyphs(stableIds: ArrayLike<number>, target: PlanTarget): PlanAcceptance;
   /** Offers a complete checkpoint containing this paragraph's committed decorations. */
@@ -358,7 +365,7 @@ interface RetainedTextState {
   desiredReleased: boolean;
   committed: ResolvedTextOptions | undefined;
   measurement: ParagraphLayoutSummary | undefined;
-  inspection: GlyphLayoutInspection | undefined;
+  inspection: GlyphLayoutColumns | undefined;
   inspectionBorrowMode: 'sparse-first' | 'promotion-ready' | 'sparse-only';
 }
 
@@ -702,13 +709,21 @@ class RenderPlannerImpl {
   /** @internal */
   _inspectText(state: RetainedTextState): GlyphLayoutInspection {
     this.#assertTextQueryable(state);
-    const cached = state.inspection;
-    if (cached !== undefined) return copyGlyphLayoutInspection(cached);
-    return copyGlyphLayoutInspection(this.#queryInspection(state));
+    const layout = state.inspection ?? this.#queryInspection(state);
+    // The copy holds each font's store, so it reads after the font or this handle is gone.
+    const stores = new Map<number, GlyphOutlineStore | undefined>();
+    for (const fontHandle of layout.fontHandles)
+      stores.set(fontHandle, this.#handleState._glyphOutlineStore(fontHandle));
+    return copyGlyphLayoutInspection(layout, (index) =>
+      storedGlyphOutline(
+        requireGlyphOutlineStore(stores.get(fontHandleAt(layout, index))),
+        layout.glyphIds[index]!,
+      ).slice(),
+    );
   }
 
   /** @internal */
-  _withGlyphs<Result>(state: RetainedTextState, read: (glyphs: BorrowedGlyphLayout) => Result): Result {
+  _readGlyphs<Result>(state: RetainedTextState, read: (glyphs: BorrowedGlyphLayout) => Result): Result {
     this.#assertTextQueryable(state);
     if (typeof read !== 'function') throw new TypeError('borrowed glyph inspection callback must be a function');
     let active = true;
@@ -722,21 +737,20 @@ class RenderPlannerImpl {
         state.inspectionBorrowMode = 'sparse-only';
       }
     }
+    const assertActive = (): void => {
+      if (!active) throw new Error('borrowed glyph layout has expired');
+    };
+    const decodeOutline: OutlineDecoder = (fontHandle, glyphId, target) =>
+      this.#handleState._glyphOutline(fontHandle, glyphId, target);
     if (inspection !== undefined) {
-      glyphs = createInspectionBorrowedGlyphLayout(inspection, () => {
-        if (!active) throw new Error('borrowed glyph layout has expired');
-      });
+      glyphs = createInspectionBorrowedGlyphLayout(inspection, assertActive, decodeOutline);
     } else {
       const publication = this.#transport.borrowParagraphLayout(
         this.#queryTextRequest(state, textShaperAbi.engine.semanticViewMasks.borrowedLayout),
         state.paragraphId,
         this.#limits.maxOutputBytes,
       );
-      glyphs = createBorrowedGlyphLayout(this.#transport, publication, () => {
-        if (!active || this.#transport.isExpired(publication.publication)) {
-          throw new Error('borrowed glyph layout has expired');
-        }
-      });
+      glyphs = createBorrowedGlyphLayout(this.#transport, publication, assertActive, decodeOutline);
       if (state.inspectionBorrowMode === 'sparse-first') state.inspectionBorrowMode = 'promotion-ready';
       this.#adoptMeasuredBindings(state);
     }
@@ -956,7 +970,7 @@ class RenderPlannerImpl {
     return measurement;
   }
 
-  #queryInspection(state: RetainedTextState): GlyphLayoutInspection {
+  #queryInspection(state: RetainedTextState): GlyphLayoutColumns {
     this.#assertTextQueryable(state);
     const publication = this.#queryTextPublication(state, textShaperAbi.engine.semanticViewMasks.layoutInspection);
     const layout = readPlannerLayouts(publication).get(state.paragraphId);
@@ -972,7 +986,7 @@ class RenderPlannerImpl {
     return this.#transport.measureParagraph(request, state.paragraphId, this.#limits.maxOutputBytes);
   }
 
-  #queryTextRequest(state: RetainedTextState, semanticViewMask: number): Uint8Array {
+  #queryTextRequest(state: RetainedTextState, semanticViewMask: number): PlannerFrameUpdate {
     const styles = compileStyles(this.#handleState, state);
     const styleMutations: PlannerStyleMutation[] = [...styles];
     for (let index = styles.length + 1; index <= state.publishedStyleCount; index += 1) {
@@ -983,8 +997,8 @@ class RenderPlannerImpl {
       });
     }
     const geometry = compileGeometry(this.#handleState, state, 0, 0);
-    const textChanged = !state.published || state.publishedText !== state.desired.text;
-    return compilePlannerFrameUpdate({
+    const textMutation = minimalTextMutation(state.publishedText, state.desired.text);
+    return {
       rootId: this.#transport.handle,
       codecHandle: this.#codec.handle,
       ...(this.#capabilitySet === undefined ? {} : { capabilitySet: this.#capabilitySet }),
@@ -995,28 +1009,23 @@ class RenderPlannerImpl {
       limits: this.#limits,
       paragraphMutations: this.#measurementParagraphMutations(state),
       paragraphOrderMutations: this.#measurementParagraphOrderMutations(),
-      textMutations: textChanged
-        ? [
-            {
-              paragraphId: state.paragraphId,
-              start: 0,
-              deleteCount: state.publishedText.length,
-              insert: state.desired.text,
-            },
-          ]
-        : [],
+      textMutations: textMutation === undefined ? [] : [{ paragraphId: state.paragraphId, ...textMutation }],
       styleMutations,
       constraints: [geometry.constraint],
       regions: geometry.regions,
       exclusions: geometry.exclusions,
       inlineObjects: compileInlineObjects(this.#handleState, state),
-    });
+    };
   }
 
-  #compileFrame(options: NormalizedPublishOptions, checkpointGeneration: number): Uint8Array {
+  #compileFrame(options: NormalizedPublishOptions, checkpointGeneration: number): PlannerFrameUpdate {
     this.#assertUniqueBaseOrders();
+    // A measured but never published text only ever existed as the engine's speculative candidate,
+    // which the frame drops on its own; only a committed paragraph has something to remove.
     const paragraphMutations = [
-      ...[...this.#removed].map((state) => ({ opcode: 'remove' as const, paragraphId: state.paragraphId })),
+      ...[...this.#removed]
+        .filter((state) => state.published)
+        .map((state) => ({ opcode: 'remove' as const, paragraphId: state.paragraphId })),
       ...[...this.#texts]
         .filter((state) => !state.removed && state.lifecycleDirty)
         .map((state) => ({
@@ -1065,7 +1074,7 @@ class RenderPlannerImpl {
         inlineObjects.push(...compileInlineObjects(this.#handleState, state));
       }
     }
-    return compilePlannerFrameUpdate({
+    return {
       rootId: this.#transport.handle,
       codecHandle: this.#codec.handle,
       ...(this.#capabilitySet === undefined ? {} : { capabilitySet: this.#capabilitySet }),
@@ -1085,7 +1094,7 @@ class RenderPlannerImpl {
       regions,
       exclusions,
       inlineObjects,
-    });
+    };
   }
 
   #validateAggregateLimits(candidate: RetainedTextLimitState, replacing?: RetainedTextState): void {
@@ -1451,8 +1460,8 @@ class RetainedTextImpl implements RetainedText {
     return this.#planner._inspectText(this.#state);
   }
 
-  withGlyphs<Result>(read: (glyphs: BorrowedGlyphLayout) => Result): Result {
-    return this.#planner._withGlyphs(this.#state, read);
+  readGlyphs<Result>(read: (glyphs: BorrowedGlyphLayout) => Result): Result {
+    return this.#planner._readGlyphs(this.#state, read);
   }
 
   copyGlyphs(stableIds: ArrayLike<number>, target: PlanTarget): PlanAcceptance {
