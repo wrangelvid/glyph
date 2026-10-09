@@ -34,8 +34,8 @@ sources:
     resource: https://threejs.org/docs/pages/Object3D.html
     title: Three.js Object3D
 generated:
-  by: openai-codex/gpt-5.6
-  at: '2026-09-16T13:00:04Z'
+  by: openai-codex/gpt-6
+  at: '2026-09-24T20:29:45Z'
 ---
 
 # Three.js text API
@@ -132,7 +132,7 @@ may override font selection, text style, and material.
 ## Batch text
 
 ```ts
-const group = three.createTextGroup({ renderOrder: 10 });
+const group = three.createTextGroup({ batching: 'auto', renderOrder: 10 });
 
 group.add(title, body, iconLabel);
 scene.add(group);
@@ -141,6 +141,18 @@ scene.add(group);
 All descendant `Text` objects under the group participate in its retained hierarchy and nearest root publication.
 Compatible Bitmap, MSDF, and Slug records may share backing storage while the command buffer emits the draw boundaries
 required by raster, font resource, material, and clipping policy.
+
+`batching` controls where compatible records may share a physical draw without creating another semantic root:
+
+| Value    | Boundary behavior                                                                                |
+| -------- | ------------------------------------------------------------------------------------------------ |
+| `auto`   | Default. A top-level authored `TextGroup` owns a boundary; nested automatic groups inherit it.   |
+| `shared` | Joins the nearest authored boundary, or the implicit root pool when no authored boundary exists. |
+| `group`  | Forces this group to own a nested boundary.                                                      |
+
+Setting `visible = false` always hides descendants. When the group owns a boundary, Three also skips its draws while
+retaining the same buffers and meshes. Use `shared` when cross-group draw coalescing matters more than draw-level group
+culling.
 
 A `Text` always batches its own spans. Inside a `TextGroup`, each child `Text.renderOrder` is the stable paragraph rank;
 the adapter sends changed ranks and group-owned scope identities through a separate order sideband, while the ordinary
@@ -366,11 +378,11 @@ the Three executor decides which GPU resources can be shared safely.
 When `context.kind === 'glyph'` and `context.format === 'pmndrs.msdf'`, both `/three` and `/three/typegpu` expose
 these `Node<'float'>` fields on `context.shader`:
 
-| Field | Meaning |
-| --- | --- |
-| `fillDistance` | Corner-preserving signed distance from the median of the sampled RGB channels, minus 0.5. |
-| `trueDistance` | Smooth signed distance from the sampled alpha channel, minus 0.5; suitable for glows and bevels. |
-| `pixelRange` | Render-target pixels per normalized distance unit, using the canonical derivative-based conversion with a minimum of 1. |
+| Field          | Meaning                                                                                                                 |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `fillDistance` | Corner-preserving signed distance from the median of the sampled RGB channels, minus 0.5.                               |
+| `trueDistance` | Smooth signed distance from the sampled alpha channel, minus 0.5; suitable for glows and bevels.                        |
+| `pixelRange`   | Render-target pixels per normalized distance unit, using the canonical derivative-based conversion with a minimum of 1. |
 
 Both distances are negative outside, zero on the edge, and positive inside. They use normalized atlas distance units
 in `[-0.5, 0.5]`; multiply by `pixelRange` for the screen-space distance used by antialiasing. The values come from the
@@ -400,21 +412,21 @@ resources declared by the active Three Codec.
 
 ## Attached glyph deformation (unshipped follow-up)
 
-`Text.withGlyphs<Result>()` is the generic synchronous borrowed-layout read boundary and returns the callback's value.
+`Text.readGlyphs<Result>()` is the generic synchronous borrowed-layout read boundary and returns the callback's value.
 The accepted D-356 design for an attached, index-addressed `Text.transformGlyphs()` mutation is deferred and is not part
 of the current Three API; `Text` exposes neither `transformGlyphs()` nor `clearGlyphTransforms()` and carries no attached
 matrix storage. A later, separately scoped implementation must prove Three and TypeGPU lifecycle, storage,
-interaction-geometry, and performance behavior together. Use `breakApart()` when the caller wants an independently
+interaction-geometry, and performance behavior together. Use `split()` when the caller wants an independently
 owned, already-shaped object whose existing per-glyph matrices can be manipulated outside the source Text lifecycle.
 
 ## Break committed glyphs into an independent object
 
-`breakApart()` copies the source paragraph's committed drawable records and any committed decoration draws into independently
+`split()` copies the source paragraph's committed drawable records and any committed decoration draws into independently
 owned groups. The copy is synchronous, is available only when `commitState().status === 'committed'`, and returns a frozen
 two-entry tuple whose decoration slot is `undefined` when the paragraph has no decoration draws.
 
 ```ts
-const [glyphs, decorations] = label.breakApart();
+const [glyphs, decorations] = label.split();
 label.parent!.add(glyphs); // sibling attachment preserves the source transform
 if (decorations !== undefined) label.parent!.add(decorations);
 label.visible = false;
@@ -463,7 +475,7 @@ result separately in tuple slot two. The detached roots keep Three's default gro
 the source boundary's under-decoration, glyph, then line-through paint order:
 
 ```ts
-const [glyphs, decorations] = label.breakApart();
+const [glyphs, decorations] = label.split();
 if (decorations !== undefined) {
   label.parent!.add(decorations);
   decorations.materials[0].opacity = 0.5;

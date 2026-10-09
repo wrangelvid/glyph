@@ -5,7 +5,6 @@ description: Implements portable font loading, retained Rust shaping and layout,
 resource: ../../../packages/glyph
 workspace_package: '@pmndrs/glyph'
 documentation_type: reference
-source_digest: 'sha256:fc166c0fbaad1a1fc87749ee4ee9487b73ee9b242d85bcdc30849a933fbb7ac2'
 tags: [package, public-api, rust, wasm, threejs, typography]
 sources:
   - id: manifest
@@ -118,7 +117,7 @@ sources:
     title: Pinned msdfgen CLI scanline and error-correction configuration
 generated:
   by: openai-codex/gpt-6
-  at: '2026-09-16T22:19:41Z'
+  at: '2026-09-24T20:41:15Z'
 ---
 
 # Package reference: `@pmndrs/glyph`
@@ -129,6 +128,8 @@ The release workflow publishes main-branch pushes under npm's `canary` tag. A pu
 publishes under `latest` only when it matches the package manifest version exactly. Both paths build and check the
 package before publishing through the existing npm trusted publisher. Prepare each release's version separately,
 then cut its stable tag from the reviewed commit after CI passes.
+`packages/glyph/CHANGELOG.md` is the hand-authored user-facing release record; its Unreleased section declares the next
+semver target and excludes CI or commit-history narration.
 
 ## Ownership
 
@@ -242,6 +243,20 @@ per-curve coverage and antialiasing weight, band header and reference bit layout
 weighted blend, and row-based vertex dilation are expressed once. A vertical band is the horizontal band in the
 transposed frame with the opposite winding sense, so both axes share one curve evaluator and quadratic solver.
 
+Slug quads are the glyph's ink box. Coverage takes each em axis's pixel scale from `fwidth`, the sum of the
+coordinate's absolute screen derivatives, so it reaches zero `0.5 · (|t.x| + |t.y|) / |t|` pixels past an edge whose
+screen direction is `t`: half a pixel for an edge axis-aligned on screen, 0.683 px at 30°, up to 0.707 px at 45°.
+Vertex dilation moves each corner exactly that far across both adjacent edges. Each axis gets its own step, solved from
+the corner's screen tangents and the w row; one step shared by both axes, as Lengyel's `SlugDilate` takes along the
+`(±1, ±1)` corner, falls short on a stretched, sheared, or tilted plane, and a half-pixel target falls short on a
+rotated one. The solve is exact under any projective transform; towards the horizon each step is held at twice its
+affine value. The TypeGPU core, the native TSL `/shaders/tsl` graph, and the CPU reference mirror use only the sign of
+the outward normal they receive. `tests/package/slug-dilation.test.mjs` runs the TypeGPU functions and the mirror on the
+CPU and checks both margins against that fringe for wide, short and tall, narrow quads under uniform, rotated,
+stretched, sheared, stretched-and-rotated, and perspective transforms. It also evaluates the package core with
+`fwidth`-derived pixel scales under every affine case and checks that no pixel with nonzero coverage falls outside the
+dilated quad. The native TSL graph cannot run on the CPU, so only review keeps it in step with the TypeGPU core.
+
 The neighboring TypeGPU modules own page texture reads, grid addressing, band traversal, and the sorted-reference
 terminator. The experimental `/three/typegpu` host supplies textures and node-valued glyph fields through `@typegpu/three`, while retaining
 native TSL only for the writable inter-stage varying and the matrix-compatible dilation path. A device-free package test
@@ -346,11 +361,15 @@ missing loads together, and keeps the current paragraph while a later selection 
 `{ font, error, ready }` shallow refs plus a promise for async setup; the format leaves compose it exactly like the
 React hooks. See [Vue and TresJS font loading](../guides/vue.md).
 
-Both component adapters snapshot paragraph property data and treat each committed prop set as complete desired state:
-removing style, layout, constraints, flow, material, or raster pixel ratio restores the corresponding default. Vue reads
-through nested reactive records while taking those snapshots, so in-place changes trigger updates without retaining
-mutable comparison state. `TextGroup` material and render order follow the same rule through one shared imperative
-apply step rather than framework prop diffing, so removing either restores the Three default. Paragraph and group
+Both component adapters treat each committed prop set as complete desired state: removing style, layout, constraints,
+flow, material, or raster pixel ratio restores the corresponding default. React and Vue pass that state through Three's
+canonical framework-update path, which normalizes it once, reuses equal package-owned property, span, and flow snapshots,
+and reports whether the desired revision changed. Neither adapter retains a caller-owned applied-state cache, so an ignored
+in-place mutation cannot swallow a later valid immutable update. Vue still detaches nested reactive records before the
+call so proxy mutation cannot rewrite a package-owned snapshot; Three adopts equal records without another clone.
+Neither adapter mutates a render-time React ref or treats object identity as paragraph correctness. `TextGroup` material
+and render order follow the same rule through one shared
+imperative apply step rather than framework prop diffing, so removing either restores the Three default. Paragraph and group
 updates request a frame on demand-rendered canvases only when the desired snapshot changed; a re-render with identical
 props requests nothing. A pending Vue font switch keeps the current Three object and its leases until replacement fonts
 are ready; constructor arguments remain valid for that mounted object's lifetime. React retains its ordinary Suspense
@@ -358,9 +377,13 @@ lifecycle.
 
 `pnpm scripts run glyph:adapters-check` runs the shared React/Vue behavior cases and each framework's lifecycle tests
 against a freshly built distribution, plus adapter formatting, lint, and source declaration checks. Shared cases cover
-prop removal, nested property replacement, frame requests with an identical-snapshot negative control, flow retention
-and removal, group material and render-order removal, loaded-to-pending font switches, and lease disposal; Vue also
-proves in-place reactive updates. Three's `Text.set({ material: undefined })` explicitly clears an override.
+prop removal, nested property replacement, presentation-only changes, equivalent PropertyList shapes, malformed property
+input, frame requests with an identical-snapshot negative control that also retains flow and measurement identity, flow
+retention and removal, group material and render-order removal, loaded-to-pending font switches, and lease disposal. Vue
+additionally proves a reuse hit followed by
+in-place nested reactive updates. React additionally proves that mutating stable caller input cannot poison the accepted
+state used by a later fresh update. Three's
+`Text.set({ material: undefined })` explicitly clears an override.
 
 The public `ThreeRoot` contract stops at that retained scene API: identity and disposal, Text/TextGroup construction,
 counts, and mutable material presentation. The renderer draw object, discovered Three Scene, root services, command
@@ -391,7 +414,15 @@ that bridge does not create another runtime or an alternate renderer integration
 
 Glyph initialization retains one settled `Promise<void>` forever, whether it fulfills or rejects: concurrent and later
 `glyph.init()` calls receive the same object. Initialization failure is fatal for that module lifetime, so an error path
-cannot repeatedly allocate large Wasm memories; a full page or module replacement is the retry boundary. Vite HMR carries
+cannot repeatedly allocate large Wasm memories; a full page or module replacement is the retry boundary. In browsers
+every default Wasm asset (the text shaper, the runtime-bake worker's font baker, and the Bitmap, MSDF and Slug bakers)
+is fetched and handed to `WebAssembly.compileStreaming`, so compilation overlaps the download and HTTP compression is
+decoded by the network stack. Streaming is attempted before inspecting response MIME or type. Following wasm-bindgen's
+loader policy, a streaming rejection falls back to buffered compilation for a basic, CORS or default response whose
+MIME is not a case-insensitive match for `application/wasm`; other streaming errors propagate. MIME parameters remain
+invalid for streaming, including `application/wasm;`. A mixed-case Wasm header preserves a consumed-body compile error
+instead of retrying the body. The same response is used without cloning or
+refetching. Node reads the packaged files directly. Vite HMR carries
 the process-local Glyph runtime through replacement data instead of instantiating a second engine. React still checks
 synchronous initialized and loaded state first, so ready renders do not enter Suspense or cross a microtask. Pending font
 loads use `suspend-react` only as React's stable suspension cache; Glyph's FontFace resource graph remains the semantic
@@ -460,7 +491,11 @@ controller's revision-aware semantic cache without accumulating removal rows, wh
 single parked controller. Scene publication also evicts that slot. This bound permits at most one dormant core
 inspection cache; `Text.glyphs()` still returns freshly copied, caller-owned columns on every call.
 
-`Text.withGlyphs(callback)` is the shared core, Three, and TypeGPU demand-read alternative for callers that need only a
+`Text.readGlyphs(callback)` replaces `withGlyphs` without a compatibility alias. The
+[archived migration](../../skills/codemod/codemods/2026-09-24-read-glyphs/instructions.md) preserves callback return values,
+synchronous exceptions and view lifetime.
+
+`Text.readGlyphs(callback)` is the shared core, Three, and TypeGPU demand-read alternative for callers that need only a
 few glyphs. Its fixed descriptor serializes no per-glyph semantic table; each indexed access copies one retained Rust
 glyph into fixed Wasm scratch, then returns one frozen scalar object in O(selected) work. Full `glyphs()` remains the
 bulk caller-owned copy. The callback must finish synchronously:
@@ -469,7 +504,7 @@ thenables, engine reentry, and retained-text mutation are rejected, and the inde
 Attached live deformation is accepted as the future D-356 design but is not shipped by either adapter. The current
 `Text` surface has no `transformGlyphs()` or `clearGlyphTransforms()` methods and allocates no attached matrix sidecar.
 A separately scoped follow-up must prove coordinated Three and TypeGPU storage, lifecycle, interaction geometry, and
-performance before exposing that API. Existing detached `Glyphs` transforms and `copyGlyphs()`/`breakApart()` remain
+performance before exposing that API. Existing detached `Glyphs` transforms and `copyGlyphs()`/`split()` remain
 the owned, already-shaped manipulation path and intentionally stop following the source `Text`.
 
 The FontFace source cache coalesces canonical-equivalent locators before I/O and converges different locators onto one
@@ -562,6 +597,12 @@ paragraph sections:
 - transform and visibility changes update Three's renderer-local sidecar without calling Wasm;
 - an empty or normalized-equal update sends nothing.
 
+Formatted-text compilers resolve cluster boundaries once and freeze their span arrays. A package-private WeakMap records
+the exact array and text value, so React and Vue may preserve that proof while replacing span records to bind fonts and
+Three may skip duplicate Unicode segmentation. The proof transfers only when every boundary is unchanged. Raw caller
+arrays, changed text or boundaries, malformed UTF-16, and arrays produced by another package copy still take the normal
+validation and cluster-alignment path.
+
 Three's ordinary scene traversal owns world-matrix composition. The root observes Text membership and ancestor state,
 publishes semantic changes once at its renderer-owned draw node, and patches root-relative transforms through a separate
 engine-free side path. Camera motion does not republish text. Text, nested `TextGroup`, and other ancestor motion,
@@ -575,8 +616,12 @@ Within a `TextGroup`, each child `Text.renderOrder` ranks that paragraph's insta
 text, styles, geometry, measurement, or per-glyph records. Ordinary content updates retain the 12-byte lifecycle record
 and omit the sideband when scope and rank are unchanged. An ungrouped
 `Text.renderOrder` retains ordinary Three draw-mesh meaning. Paragraph rank is deliberately absent from glyph storage and
-draw keys: compatible spans and grouped paragraphs therefore coalesce by resource, material, and fixed paint layer, with
-under-decoration, glyph, and over-decoration layers preserving CSS paint order.
+draw keys: compatible spans and grouped paragraphs therefore coalesce within their authored batch boundary by resource,
+material, and fixed paint layer, with under-decoration, glyph, and over-decoration layers preserving CSS paint order.
+`TextGroup.batching` controls only that physical boundary; it does not create another planner, Wasm root, or publication
+stream. The default `auto` makes each top-level authored group a boundary while nested automatic groups inherit it;
+`group` forces a nested boundary, and `shared` joins the nearest authored boundary or the implicit root pool. Hiding a
+boundary-owning group skips its compatible draws without resizing buffers, replacing meshes, or entering Wasm.
 When a rank-only permutation keeps the committed Codec, capability, one-batch single-aggregate-draw storage topology,
 and renderable stable-ID set, Rust copies the committed physical records into their new order and publishes write patches only. It transactionally
 updates its internal aggregate primitive/draw spans but does not republish unchanged buffers, resources, primitives,
@@ -700,7 +745,10 @@ and textures under one retained identity; groups cannot nest, geometry cannot re
 the primary render resource used by the command-buffer primitive. Bitmap repeated strikes, MSDF atlas/range companions, and Slug
 repeated page groups all compile through this contract. Capability profiles contain capabilities only;
 `compileCodec()` assigns their nonzero wire IDs by descriptor order, and ordinary single-profile frames omit the
-selector.
+selector. Codec registration rejects a selected program when its declared buffers exceed the capability set's
+`maxBuffersPerDraw`: glyph selection prefers an exact set binding over the wildcard for the same technique and variant,
+while decoration selection retains declaration-order first-match behavior. Raster program assembly reports the same
+limit as a `RangeError` and names the system buffers included in the count.
 
 `RasterResourceId` is the authoritative identity of one renderer resource realization. Reusing an ID means the format,
 schema role, companion set, metadata, and bytes are unchanged; a Codec must mint a new ID when any of those change. The
@@ -754,13 +802,79 @@ the selected font formats at the call that accepts a style, so an unsupported ef
 silently degraded command buffer. The semantic ABI carries effect color, width, offset, and inherited opacity only for
 raster programs that opt in.
 
+## Glyph outlines
+
+Glyph geometry for colliders, extrusion, or other CPU consumers is core-font data, not raster data ([glyph outlines](../planning/decisions/glyph-outlines.md)).
+`glyph bake --outlines` and Node `bakeFont({ font: { outlines: true } })` keep the face's own outline tables, `glyf`
+with `loca` or `CFF `, unchanged in a small SFNT beside `head` and `maxp`, stored as one optional `PMNDRS_font.outlines`
+buffer view. The object's presence is the flag, and the CLI's up-to-date check treats a change of flag as stale. The view
+is outside `shaping.fingerprint`, so outlines change no raster's compatibility. Only an outlined bake writes
+`PMNDRS_font` version 1; a bake without outlines still writes version 0, byte-identical to earlier bakes. A face without
+outline tables, such as a bitmap-only face, fails an outline bake with `MISSING_TABLE`, and a CFF2 face fails with
+`UNSUPPORTED_OUTLINE_FORMAT`. Outlines cost about the face's own outline tables: 0.46 to 0.94 times the source file
+across the fixture faces (Inter adds 226 KB to 412 KB; Noto Sans CJK JP adds 15.5 MB to 16.5 MB).
+
+An outline describes a glyph ID of a font, not one placement, in em units (1 is the font size) with y down and the
+origin at the pen position on the baseline, like every box the layout publishes. A caller places a point at
+`glyph.x + ex * glyph.fontSize`, `glyph.y + ey * glyph.fontSize`; equal `fontHandle` and `glyphId` mean equal outlines, so
+a caller can cache one shape per key. A fallback glyph reads from the font that shaped it. Every read path throws a
+`TypeError` for a glyph whose font has no outlines; outlines are optional today and planned to become required.
+
+- **Borrowed:** `text.readGlyphs((glyphs) => glyphs.outlineAt(index, target?))` returns a `GlyphOutlineView` of
+  `fontHandle`, `glyphId`, and typed-array views over the font's decoded store: endpoint-shared `points` (segment `s` of
+  contour `c` uses points `2s + c` through `2s + c + 2`), `contourEnds` (exclusive end of each contour, as a segment
+  index), and `segmentLines` (`1` for a line, `0` for a quadratic). A `target` is refilled and returned, which saves only
+  the holder. The views are documented as valid only inside the callback, which keeps the freedom to back them with engine
+  memory again.
+- **Owned:** `text.glyphs().outlineAt(index)` returns caller-owned `GlyphOutlineContour[]` of
+  `[x0, y0, cx, cy, x1, y1, isLine]` tuples built from the same store, so both paths agree. It is a non-enumerable method
+  on the copied inspection, so the columns still spread, compare, and structured-clone as plain data. The copy keeps its
+  fonts' stores, so a read makes no engine call and survives the font's and the handle's disposal. A glyph's frozen tuples
+  are built on first read and shared by every later one.
+- **Detached:** `Glyphs.outlineAt(index)` answers `text.glyphs().outlineAt(index)` from the inspection `split()`
+  retained ([detached glyph copies](#root-assisted-detached-glyph-copies)).
+
+A line keeps its midpoint as its control point, so code that ignores the flag still draws it. Contours keep the source
+order and winding for nonzero filling, and blank glyphs return no contours.
+
+**Decoding.** The shaper decodes with read-fonts, which HarfRust already links: TrueType simple and composite glyphs
+follow Skrifa's FreeType-style unscaled loader, and CFF uses read-fonts' charstring evaluator. A TrueType glyph nests
+composites at most 32 levels deep and places at most 65,535 components and 65,535 points, so a crafted font cannot make a
+decode unbounded. TrueType outlines are exact; each CFF cubic becomes Slug's `DEFAULT_CUBIC_SUBDIVISIONS` (four)
+equal-parameter quadratics through its shared split, within about 1.15 font units on the CFF fixtures. The decoder writes
+em-space `f32` points with the contour ends and line flags into one word-aligned result. The decoder adds 64,956 raw bytes
+(24,677 gzip) to `text-shaper.wasm`; Skrifa's outline drawing measured 97 KB gzip in the same shaper and cannot be
+trimmed by feature. `font-baker.wasm` draws no outlines: the bake validator decodes every glyph with the runtime decoder,
+so a bake cannot ship an outline the runtime would refuse. Variation axes and a runtime-bake outline option are not
+implemented.
+
+**Loading.** The loader decodes every glyph behind the load promise, where the artifact fetch already dominates, into one
+store the font owns: the columns of every glyph's view back to back plus a per-glyph offset table. A read is then plain
+data with no engine memory, and a later outlined bake of a font that first loaded without outlines adds its store to the
+deduplicated font. The decode runs in a fresh shaper instance compiled from the module the engine shared, so a
+caller-supplied `glyph.init({ wasm })` decodes too, or from the default module when a font loads before the engine
+starts. Natively over every glyph: Inter 2,937 glyphs in 3.6 ms to 1.37 MB, Source Serif 4 2.1 ms to 0.85 MB, Font
+Awesome 3.9 ms to 1.62 MB, Amiri 6,710 glyphs in 13.3 ms to 5.06 MB, and Noto Sans CJK JP 65,535 glyphs in 757 ms to
+129 MB. The planned triplet stream (#244) replaces this with a faster decode into a smaller i16 store.
+
+**Evidence.** Rust tests compare every glyph of all nine fixture faces, TrueType and CFF, segment for segment with
+Skrifa, including composites rewritten to matched-point anchors and scaled offsets and contours that start off-curve, and
+check the endpoint-shared layout, contour ends, line flags, midpoint controls, and em-space y-down points of Inter, Font
+Awesome, and Dancing Script. Composites that multiply their components or points past the bounds are refused, and
+corrupted `glyf`, `loca`, and `CFF ` tables fail without panicking. The validator rejects an outline SFNT that is out of
+profile, misidentified, or undecodable. Three Text tests place every TrueType glyph's outline at its pen position and
+size against the layout's ink box, check every CFF on-curve point against it, check the baseline at two font sizes and the
+view's layout invariants, compare owned tuples with borrowed views, read a font-stack fallback glyph from its own font,
+survive Wasm memory growth, and read identical outlines from Bitmap and Slug. A detached `Glyphs` object's outlines equal
+the source's at every index, survive a re-layout and the font's disposal, and reject indices outside the object.
+
 ## Semantic queries
 
 Publication emits no semantic readback by default. A renderer that needs current local bounds requests the measurement
 sidecar on the same update; core copies it into the retained text cache before target acceptance, so plan publication and
 bounds cost one Wasm hop. Every semantic mutation invalidates that cache immediately. `Text.measure()` then answers from
 the cache or explicitly measures current desired state, while `Text.glyphs()` similarly requests the positioned
-inspection lane. `Text.withGlyphs()` prepares that same state without emitting the full inspection table and copies only
+inspection lane. `Text.readGlyphs()` prepares that same state without emitting the full inspection table and copies only
 explicitly indexed records. None of these queries traverses matrices, realizes renderer resources, flips publication
 slots, or burns a revision.
 
@@ -810,12 +924,16 @@ The semantic values preserve information useful to callers:
 
 ## Root-assisted detached glyph copies
 
-Public `Text.breakApart()` requests committed glyph and decoration subsets through its owning root. Rust compacts the
+`Text.split()` replaces `Text.breakApart()` without a deprecated alias. Existing callers can use the
+[archived migration](../../skills/codemod/codemods/2026-09-24-text-split/instructions.md).
+The rename preserves the tuple result, committed-state requirement, source independence, and disposal ownership.
+
+Public `Text.split()` requests committed glyph and decoration subsets through its owning root. Rust compacts the
 selected paragraph records through the installed Codec into complete checkpoints; it does not expose buffer offsets or
 private planning objects for each renderer to reconstruct. Root services synchronously decode each detached copy into its
 destination renderer. The query does not advance the source root's revision or publication generation.
 
-Three's `Text.breakApart()` uses both planner requests and returns the frozen tuple
+Three's `Text.split()` uses both planner requests and returns the frozen tuple
 `[Glyphs, Decorations | undefined]`. It preserves the source transform, Codec-defined batching, fallback raster formats,
 shared immutable atlas/page leases, and supplied geometry while adding one full affine matrix per drawable record. Its
 local methods mirror `InstancedMesh`; world methods bridge physics state to root-relative storage. Bulk world-space
@@ -824,11 +942,24 @@ callers update the detached root once, invert its world matrix once, convert eac
 root-relative resource leases belong to each detached object,
 so the pair may outlive the source `Text`, font, and loader without sharing mutable presentation state. The source `Text`
 stays live and may continue publishing while detached objects remain unchanged.
+`Glyphs` contains only glyphs with render records; blank glyphs such as spaces are excluded. `count`, `glyphAt`,
+`measurements`, `outlineAt`, and matrix methods use dense drawable indices, throwing `RangeError` outside
+`0 <= index < count`. These indices need not match `text.glyphs()` layout indices. A private source-index column
+preserves the relationship for outline reads, while matrices and pivots remain flat per-drawable arrays (`count * 16`
+and `count * 2`). Each drawable maps to its physical render record. A `DetachedGlyph` carries three identities: `index` is its position in this detached object, `key` is the
+same occurrence across a reflow (the shipped contract, unchanged), and `fontHandle` plus `glyphId` are the same shape: the
+plain-number id of the font that shaped it (never reused, not a lease, equal to
+`text.glyphs().fontHandles[glyphFontSlots[index]]`) and its index in that font, filled for every index from the retained
+layout. Equal pairs mean an equal outline, so a shape built once serves every occurrence. There is no public lookup of
+a font by id. `Glyphs.outlineAt(index)` ([Glyph outlines](#glyph-outlines)) reads from the owned inspection
+`split()` retained, so like `glyphAt` it is data: it reads after the source re-lays out and after the font or the
+`Glyphs` object is disposed. Its origin is the pivot of `setMatrixAt`'s matrix; scale by `DetachedGlyph.fontSize` and
+negate y to get the local frame that matrix places.
 
 Decoration passes are not glyph records and retain an independent object and lifetime; tuple slot two is `undefined`
 when the committed paragraph has no decoration draws. Three coordinates both roots' draw ranges so underline/overline
 remain below glyphs and line-through remains above them without assigning a group-level render order. If either import
-fails, `breakApart()` releases everything it created before throwing. Neither path reconstructs child `Text` objects,
+fails, `split()` releases everything it created before throwing. Neither path reconstructs child `Text` objects,
 installs mutable presentation overrides, creates physics bodies, or infers collision shapes. The detailed ownership and
 evidence contract is in
 [Planner-assisted detached glyph slices](../planning/detached-glyph-slice.md).
@@ -860,7 +991,9 @@ layout, and constraint snapshots. Reusing the same readonly outer record is an O
 outer record compares it with the accepted snapshot and clones only a material change. A nested edit submitted through a
 new outer style, layout, or constraint record therefore cannot rewrite history or disappear through `/typegpu` or a
 custom `GlyphConfig`. Three's retained authoring model uses the same snapshot utility, and its package-owned records cross
-the controller seam without a second clone. A plain string replacement reuses its normalized font, transform, material,
+the controller seam without a second clone. Equivalent normalized Three text updates preserve the desired revision and
+cached measurements without staging another publication. Explicit font or material assignments still invalidate
+publication, including renderer retries after a rejected frame. A plain string replacement reuses its normalized font, transform, material,
 style, layout, and constraint ownership. When those accepted input identities return through a content-only update,
 normalization skips recursive comparison and cloning; a new outer property record still takes the validating path.
 Equal-length content emits only the minimal scalar-aligned text record; length changes additionally republish
@@ -1031,6 +1164,15 @@ are unchanged.
 
 [^msdfgen-cli]: msdfgen 1.13 `main.cpp`, scanline defaults and post-generation error-correction configuration.
 
+Direct TypeGPU text owns its position coordinates separately from semantic text state. Position-only updates write the
+uniform without staging a semantic publication; unchanged coordinates do not write it again. Mixed updates validate
+and stage semantic changes before moving the uniform, so rejected caller input preserves the accepted position.
+
+Planner frames are prepared as validated records and written directly into the retained Wasm request arena, including
+paragraph queries. The writer respects the arena view's byte offset and clears reused storage before encoding. Query
+requests retain minimal text mutations; removal requests include only paragraphs previously published. Output growth
+invalidates prior borrowed results and rewrites the request before retrying, preserving the existing acceptance fence.
+
 ## Legacy-path and duplication audit
 
 The Rust command buffer is the only glyph-packing implementation. Rust is also the production authority for Unicode
@@ -1183,7 +1325,10 @@ exports, calls, branches, and clock reads are now absent from the package source
 workload markers and the direct Wasm timer remain outside the shipped library.
 
 After the final plan-application lifecycle audit, Three sizes indexed transforms from live paragraph IDs instead of
-scanning every glyph record in JavaScript. A renderer preparation failure discards its candidate, retains the last
+scanning every glyph record in JavaScript. Patch-only publications retain the transform table and its index instead of
+preparing and uploading them again; the ordinary synchronizer still applies transforms and visibility changed in that
+frame. Replacement publications prepare fresh transform ownership and resolve visibility through the application scene.
+A renderer preparation failure discards its candidate, retains the last
 accepted plan fence and error, and waits for explicit renderer-relevant invalidation to request a checkpoint. Dirty upload
 ranges accumulate across presentation restoration and Rust patches; buffer/resource generations dispose only their exact
 dependent materials; and direct materials survive indexed transform-table growth. A loaded font owns one
@@ -1409,7 +1554,17 @@ or split a previously shaped word.
 
 The legal stream begins with Unicode 17 UAX #14 opportunities, discards any optional opportunity that falls inside a
 UAX #29 extended grapheme, and intersects the result with HarfRust unsafe-to-break shaping boundaries. The default has
-no dictionary segmentation, language-specific hyphenation, or locale tailoring. Optional language-resource imports,
+no dictionary segmentation, language-specific hyphenation, or locale tailoring. A Unicode-legal break that HarfRust
+marks unsafe stays allowed within one run, binding, and font, as in browser line breaking: the line fitter prices it
+from boundary-local shaping corrections, computed lazily per boundary and stored in a cluster lane, so line layout is
+exact at the breaks it takes (D-372). A break no space precedes is refused when its island shaped alone draws other glyph ids than the paragraph (a ligature or contextual unit), so Glyph never splits such a unit, unlike Chromium; a positioning-only difference keeps the break. The check is lazy: it rides the `L` pricing shaping at the breaks the fitter evaluates, and an island longer than `ISLAND_CAP` clusters is never reshaped and stays a non-break. Min-content reads the paragraph shaping's word widths uncorrected, like Blink's fast
+min-content path, so it never prices every corrected boundary. A line that starts at such a corrected boundary draws the glyphs of the island it opens shaped alone, in
+the same pass that prices it (`line_edge_records`, boundary-shape records beside the ellipsis one), so it matches the
+line shaped by itself. A line that ends at one, unless a space ends it, draws the island it closes shaped alone too
+(the tail record, `FlowFragment::tail_index`), as Blink reshapes a line end that no breakable space
+precedes (so only at positioning-only breaks); a hanging space keeps the paragraph's glyphs, as browsers keep the terminating space in the shaping run. Extra glyphs an edge record draws beyond its cluster's paragraph glyphs keep the stable ids of the previous layout's records, found by the text unit of their cluster and their ordinal (`previous_edge_ids`), so an edit that moves offsets keeps them. An island a boundary prices is the island its line edge draws, so one shaping serves both and is kept with the cluster arena (`ClusterArena::islands`): a relayout over the same clusters, such as a width change, shapes nothing, and an edit rebuilds the arena empty.
+Edge records lay out cluster by cluster, so spans that split only paint or decoration keep their own extents and
+justification. A paragraph with a right-to-left or overridden run marks no unsafe break as correctable, as on main, so its widths and drawn glyphs cannot disagree (known limitation until edge records follow visual order). Optional language-resource imports,
 including a versioned linear-memory ABI that can move language tables out of the default Wasm payload, are tracked in
 [#163](https://github.com/pmndrs/glyph/issues/163); no renderer adapter may become a second layout implementation.
 
